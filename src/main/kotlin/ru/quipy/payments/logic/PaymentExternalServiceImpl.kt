@@ -6,9 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.NonBlockingOngoingWindow
 import ru.quipy.common.utils.OngoingWindow
-import ru.quipy.common.utils.RateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -36,21 +34,15 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private var rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-<<<<<<< HEAD
-    private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
-=======
-    private val ongoingWindow = OngoingWindow(parallelRequests)
->>>>>>> b9f9588
     private val client = OkHttpClient.Builder().build()
+    private val ongoingWindow = OngoingWindow(parallelRequests)
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
-
-        // ongoingWindow.acquire()
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
@@ -63,59 +55,16 @@ class PaymentExternalSystemAdapterImpl(
             post(emptyBody)
         }.build()
 
-<<<<<<< HEAD
-        while (ongoingWindow.putIntoWindow() is NonBlockingOngoingWindow.WindowResponse.Fail) {
-            if (now() + requestAverageProcessingTime.toMillis() > deadline) {
-                logger.warn("[$accountName] Payment timeout for payment: $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, "Request timeout.")
-                }
-                return
-            }
-=======
         try {
             ongoingWindow.acquire()
             rateLimiter.tickBlocking()
->>>>>>> b9f9588
 
-            Thread.sleep(10);
-        }
-
-        var retryAfterTime = 2;
-        while (true) {
-            if (now() + requestAverageProcessingTime.toMillis() < deadline) {
-                rateLimiter.tickBlocking()
-                val sendResult = sendRequest(request, paymentId, transactionId)
-                if (sendResult == SendRequestResult.TemporaryError) {
-                    retryAfterTime *= 2;
-                    Thread.sleep(retryAfterTime.toLong())
-                } else {
-                    break
-                }
-            } else {
-                logger.error("[$accountName] Payment timeout for payment: $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, "Request timeout.")
-                }
-                break
-            }
-        }
-
-        ongoingWindow.releaseWindow()
-    }
-
-    override fun price() = properties.price
-    override fun isEnabled() = properties.enabled
-    override fun name() = properties.accountName
-
-    private fun sendRequest(request: Request, paymentId: UUID, transactionId: UUID): SendRequestResult {
-        try {
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
                     logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
                 }
 
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
@@ -125,16 +74,6 @@ class PaymentExternalSystemAdapterImpl(
                 paymentESService.update(paymentId) {
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
-
-                if (!body.result) {
-                    return if (body.message == "Temporary error") {
-                        SendRequestResult.TemporaryError
-                    } else {
-                        SendRequestResult.Error
-                    }
-                }
-
-                return SendRequestResult.Success
             }
         } catch (e: Exception) {
             when (e) {
@@ -153,21 +92,17 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
-<<<<<<< HEAD
-            return SendRequestResult.Error
-=======
-        }
-        finally {
+        } finally {
             ongoingWindow.release()
->>>>>>> b9f9588
         }
     }
-}
 
-enum class SendRequestResult {
-    Error,
-    TemporaryError,
-    Success
+    override fun price() = properties.price
+
+    override fun isEnabled() = properties.enabled
+
+    override fun name() = properties.accountName
+
 }
 
 public fun now() = System.currentTimeMillis()
