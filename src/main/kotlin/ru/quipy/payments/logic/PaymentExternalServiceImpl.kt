@@ -47,6 +47,10 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
+        while (!rateLimiter.tick()) {
+            Thread.sleep(1000)
+        }
+        
         ongoingWindow.acquire()
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
