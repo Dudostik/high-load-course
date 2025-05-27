@@ -6,6 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.NonBlockingOngoingWindow
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.RateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
@@ -37,7 +38,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private var rateLimiter : RateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
-    private val ongoingWindow = OngoingWindow(parallelRequests)
+    private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
 
     private val client = OkHttpClient.Builder().build()
 
@@ -47,11 +48,7 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
-        while (!rateLimiter.tick()) {
-            Thread.sleep(1000)
-        }
-        
-        ongoingWindow.acquire()
+        // ongoingWindow.acquire()
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
@@ -65,6 +62,15 @@ class PaymentExternalSystemAdapterImpl(
         }.build()
 
         try {
+            val windowResponse = ongoingWindow.putIntoWindow()
+            if (windowResponse is NonBlockingOngoingWindow.WindowResponse.Fail) {
+                logger.warn("[$accountName] Window is full, current size: ${windowResponse.currentWinSize}, payment $paymentId will be dropped")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Window is full. Current ongoing requests: ${windowResponse.currentWinSize}")
+                }
+                return
+            }
+
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -100,7 +106,7 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
         finally {
-            ongoingWindow.release()
+            ongoingWindow.releaseWindow()
         }
     }
 
