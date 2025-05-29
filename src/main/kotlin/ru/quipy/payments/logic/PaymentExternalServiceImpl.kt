@@ -27,6 +27,9 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+        private const val INITIAL_RETRY_DELAY_MS = 100L
+        private const val MAX_RETRY_DELAY_MS = 5000L
+        private const val RETRY_MULTIPLIER = 1.5
     }
 
     private val serviceName = properties.serviceName
@@ -67,28 +70,47 @@ class PaymentExternalSystemAdapterImpl(
             Thread.sleep(10);
         }
 
-        var retryAfterTime = 2;
-        while (true) {
-            if (now() + requestAverageProcessingTime.toMillis() < deadline) {
-                rateLimiter.tickBlocking()
-                val sendResult = sendRequest(request, paymentId, transactionId)
-                if (sendResult == SendRequestResult.TemporaryError) {
-                    retryAfterTime *= 2;
-                    Thread.sleep(retryAfterTime.toLong())
-                } else {
+        // Добавил блок try-finally
+        try {
+            var retryDelay = INITIAL_RETRY_DELAY_MS
+            var attempt = 0
+
+            while (true) {
+                val currentTime = now()
+                if (currentTime + requestAverageProcessingTime.toMillis() >= deadline) {
+                    logger.error("[$accountName] Payment timeout for payment: $paymentId")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, currentTime, transactionId, "Request timeout.")
+                    }
                     break
                 }
-            } else {
-                logger.error("[$accountName] Payment timeout for payment: $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, "Request timeout.")
+
+                rateLimiter.tickBlocking()
+                val sendResult = sendRequest(request, paymentId, transactionId)
+
+                when (sendResult) {
+                    SendRequestResult.Success -> break
+                    SendRequestResult.Error -> break
+                    SendRequestResult.TemporaryError -> {
+                        attempt++
+                        val nextRetryTime = currentTime + retryDelay  // Добавил расчёт времени следующей попытки
+                        if (nextRetryTime + requestAverageProcessingTime.toMillis() >= deadline) {
+                            logger.error("[$accountName] Payment timeout for payment: $paymentId")
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, currentTime, transactionId, "Request timeout.")
+                            }
+                            break
+                        }
+
+                        Thread.sleep(retryDelay)
+                        // Добавил ограничение максимальной задержки и плавное увеличение
+                        retryDelay = (retryDelay * RETRY_MULTIPLIER).toLong().coerceAtMost(MAX_RETRY_DELAY_MS)
+                    }
                 }
-
-                break
             }
+        } finally {  // Добавлен finally блок
+            ongoingWindow.releaseWindow()
         }
-
-        ongoingWindow.releaseWindow()
     }
 
     override fun price() = properties.price
