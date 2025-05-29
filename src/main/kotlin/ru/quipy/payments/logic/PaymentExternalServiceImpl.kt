@@ -6,6 +6,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.LeakingBucketRateLimiter
+import ru.quipy.common.utils.NonBlockingOngoingWindow
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -35,8 +37,8 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder().build()
-    private val ongoingWindow = OngoingWindow(parallelRequests)
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
+    private val rateLimiter = LeakingBucketRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1), rateLimitPerSec)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -56,8 +58,19 @@ class PaymentExternalSystemAdapterImpl(
         }.build()
 
         try {
-            ongoingWindow.acquire()
-            rateLimiter.tickBlocking()
+            val windowResponse = ongoingWindow.putIntoWindow()
+            if (windowResponse is NonBlockingOngoingWindow.WindowResponse.Fail) {
+                logger.warn("[$accountName] Window is full, current size: ${windowResponse.currentWinSize}, payment $paymentId will be dropped")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Window is full. Current ongoing requests: ${windowResponse.currentWinSize}")
+                }
+                return
+            }
+
+            if (!rateLimiter.tick()) {
+                logger.warn("[$accountName] Rate limit exceeded, payment $paymentId delayed")
+                rateLimiter.tickBlocking()
+            }
 
             client.newCall(request).execute().use { response ->
                 val body = try {
@@ -93,7 +106,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
-            ongoingWindow.release()
+            ongoingWindow.releaseWindow()
         }
     }
 
